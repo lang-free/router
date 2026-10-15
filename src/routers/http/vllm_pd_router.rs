@@ -3484,4 +3484,169 @@ mod tests {
         drop(response);
         assert_eq!(decode.load(), 0);
     }
+    #[test]
+    fn review_default_cache_affinity_and_cold_mix() {
+        use crate::policies::{CacheAwareConfig, CacheAwarePolicy, LoadBalancingPolicy};
+        let router = test_vllm_pd_router();
+        let workers: Vec<Arc<dyn Worker>> = (0..8)
+            .map(|i| {
+                Arc::new(BasicWorker::new(
+                    format!("http://d-{i}"),
+                    WorkerType::Decode,
+                )) as Arc<dyn Worker>
+            })
+            .collect();
+        let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+            eviction_interval_secs: 0,
+            ..Default::default()
+        });
+        policy.init_workers(&workers);
+        let prefix = "shared conversation prefix ".repeat(100);
+        let (warm_idx, guard) = router
+            .select_and_reserve_decode(&policy, &workers, Some(&prefix), None)
+            .unwrap();
+        drop(guard);
+        // Sequential turns preserve affinity as the conversation grows.
+        for turn in 0..8 {
+            let text = format!("{prefix}turn {turn}");
+            let (idx, guard) = router
+                .select_and_reserve_decode(&policy, &workers, Some(&text), None)
+                .unwrap();
+            assert_eq!(idx, warm_idx);
+            drop(guard);
+        }
+        // A pending warm request does not force loss of affinity below the default threshold.
+        let (_, first) = router
+            .select_and_reserve_decode(&policy, &workers, Some(&prefix), None)
+            .unwrap();
+        let (idx, second) = router
+            .select_and_reserve_decode(&policy, &workers, Some(&prefix), None)
+            .unwrap();
+        assert_eq!(idx, warm_idx);
+        // A disjoint cold request can use an unoccupied D without erasing warm affinity.
+        let (cold_idx, cold) = router
+            .select_and_reserve_decode(&policy, &workers, Some("ZZZZ unrelated cold prompt"), None)
+            .unwrap();
+        assert_ne!(cold_idx, warm_idx);
+        drop((first, second, cold));
+        assert!(workers.iter().all(|w| w.load() == 0));
+        let (idx, guard) = router
+            .select_and_reserve_decode(&policy, &workers, Some(&prefix), None)
+            .unwrap();
+        assert_eq!(idx, warm_idx);
+        drop(guard);
+    }
+
+    #[test]
+    fn review_default_cold_burst_reservations_balance() {
+        use crate::policies::{CacheAwareConfig, CacheAwarePolicy, LoadBalancingPolicy};
+        let router = test_vllm_pd_router();
+        let workers: Vec<Arc<dyn Worker>> = (0..8)
+            .map(|i| {
+                Arc::new(BasicWorker::new(
+                    format!("http://d-{i}"),
+                    WorkerType::Decode,
+                )) as Arc<dyn Worker>
+            })
+            .collect();
+        let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+            eviction_interval_secs: 0,
+            ..Default::default()
+        });
+        policy.init_workers(&workers);
+        let mut guards = Vec::new();
+        for i in 0..24 {
+            let text = char::from_u32(0x400 + i).unwrap().to_string().repeat(100);
+            guards.push(
+                router
+                    .select_and_reserve_decode(&policy, &workers, Some(&text), None)
+                    .unwrap()
+                    .1,
+            );
+        }
+        assert!(workers.iter().all(|w| w.load() == 3));
+        drop(guards);
+        assert!(workers.iter().all(|w| w.load() == 0));
+    }
+
+    #[tokio::test]
+    async fn review_dispatch_failures_release_only_owned_reservation() {
+        for path in ["/v1/chat/completions", "/v1/completions", "/v1/responses"] {
+            for mode in [
+                "prefill_http",
+                "prefill_transport",
+                "decode_http",
+                "decode_transport",
+                "decode_timeout",
+            ] {
+                let prefill_url = if mode == "prefill_transport" {
+                    "http://127.0.0.1:1".to_string()
+                } else if mode == "prefill_http" {
+                    spawn_test_server(
+                        axum::Router::new()
+                            .fallback(|| async { StatusCode::INTERNAL_SERVER_ERROR }),
+                    )
+                    .await
+                } else {
+                    spawn_test_server(
+                        axum::Router::new()
+                            .fallback(|| async { axum::Json(json!({"kv_transfer_params": {}})) }),
+                    )
+                    .await
+                };
+                let decode_url = if mode == "decode_transport" {
+                    "http://127.0.0.1:1".to_string()
+                } else if mode == "decode_timeout" {
+                    spawn_test_server(
+                        axum::Router::new()
+                            .fallback(|| async { std::future::pending::<StatusCode>().await }),
+                    )
+                    .await
+                } else {
+                    spawn_test_server(
+                        axum::Router::new()
+                            .fallback(|| async { StatusCode::INTERNAL_SERVER_ERROR }),
+                    )
+                    .await
+                };
+                let prefill: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+                    prefill_url,
+                    WorkerType::Prefill {
+                        bootstrap_port: None,
+                    },
+                ));
+                let decode: Arc<dyn Worker> =
+                    Arc::new(BasicWorker::new(decode_url, WorkerType::Decode));
+                let mut router = test_vllm_pd_router();
+                router.http_client = reqwest::Client::builder()
+                    .timeout(std::time::Duration::from_millis(200))
+                    .build()
+                    .unwrap();
+                router.pd_router.client = router.http_client.clone();
+                router.pd_router.worker_registry.register(prefill);
+                router.pd_router.worker_registry.register(decode.clone());
+                // Sentinel load catches accidental double release hidden by saturating counters.
+                decode.increment_load();
+                let response = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    dispatch_reservation_test_request(&router, path),
+                )
+                .await
+                .unwrap();
+                assert!(
+                    response.status().is_server_error(),
+                    "{path} {mode}: {}",
+                    response.status()
+                );
+                assert_eq!(decode.load(), 1, "{path} {mode}");
+                drop(response);
+                assert_eq!(
+                    decode.load(),
+                    1,
+                    "response drop must not release again: {path} {mode}"
+                );
+                decode.decrement_load();
+            }
+        }
+    }
 }
