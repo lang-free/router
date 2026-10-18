@@ -242,6 +242,52 @@ impl CacheAwarePolicy {
         }
     }
 
+    fn select_worker_min_load(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        request_text: Option<&str>,
+        healthy_indices: &[usize],
+        model_id: &str,
+        max_load: usize,
+        min_load: usize,
+    ) -> Option<usize> {
+        // Log load balancing trigger (only compute worker loads if debug enabled)
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            let worker_loads: Vec<(&str, usize)> =
+                workers.iter().map(|w| (w.url(), w.load())).collect();
+            debug!(
+                "Load balancing triggered | max: {} | min: {} | workers: {:?}",
+                max_load, min_load, worker_loads
+            );
+        }
+
+        RouterMetrics::record_load_balancing_event();
+        RouterMetrics::set_load_range(max_load, min_load);
+
+        let min_load_idx = Self::least_loaded(workers, healthy_indices)?;
+
+        // Even in imbalanced mode, update the tree to maintain cache state
+        if let Some(text) = request_text {
+            // Get the tree reference without locking the entire HashMap
+            // DashMap only locks the specific shard containing this key
+            let tree = self.trees.get(model_id).map(|entry| entry.value().clone());
+
+            if let Some(tree) = tree {
+                let worker_url = workers[min_load_idx].url();
+                tree.insert(text, worker_url);
+            } else {
+                debug!(
+                    "Warning: No tree found for model '{}', skipping cache update",
+                    model_id
+                );
+            }
+        }
+
+        Self::record_selection(workers, min_load_idx);
+
+        Some(min_load_idx)
+    }
+
     fn load_range(&self, workers: &[Arc<dyn Worker>]) -> (usize, usize) {
         let (min, max) = workers.iter().fold((usize::MAX, 0usize), |(min, max), w| {
             let load = w.load();
@@ -281,10 +327,10 @@ impl CacheAwarePolicy {
             result.matched_char_count as f32 / result.input_char_count as f32
         };
         if match_rate > self.config.cache_threshold {
-            if let Some(idx) = healthy
+            if let Some(idx) = workers
                 .iter()
-                .copied()
-                .find(|&idx| workers[idx].url() == result.tenant.as_ref())
+                .position(|worker| worker.url() == result.tenant.as_ref())
+                .filter(|&idx| workers[idx].is_healthy())
             {
                 return Some((idx, false));
             }
@@ -299,17 +345,17 @@ impl CacheAwarePolicy {
         RouterMetrics::record_policy_decision("cache_aware", workers[idx].url());
     }
 
-    /// Shared selection algorithm for legacy selection and atomic reservation.
-    /// The commit closure runs under the admission lock; all text-length work
-    /// and metric recording run outside it.
+    /// Prepare cache affinity outside the admission lock, then recheck load and
+    /// eligibility before committing. Legacy selection keeps its original
+    /// single-pass flow and shares the policy decisions below.
     fn select_with_commit<T>(
         &self,
-        context: Option<&SelectionContext>,
+        context: &SelectionContext,
         workers: &[Arc<dyn Worker>],
         request_text: Option<&str>,
         commit: impl FnOnce(usize) -> T,
     ) -> Option<(usize, T)> {
-        let selection = context.map(|c| c.lock.lock());
+        let selection = context.lock.lock();
         let healthy = get_healthy_worker_indices(workers);
         let model_id = normalize_model_key(workers[*healthy.first()?].model_id());
         let (min, max) = self.load_range(workers);
@@ -339,7 +385,7 @@ impl CacheAwarePolicy {
             .as_ref()
             .map(|tree| tree.prefix_match_with_counts(text));
 
-        let selection = context.map(|c| c.lock.lock());
+        let selection = context.lock.lock();
         let healthy = get_healthy_worker_indices(workers);
         healthy.first()?;
         let (min, max) = self.load_range(workers);
@@ -379,8 +425,39 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         request_text: Option<&str>,
         _headers: Option<&RequestHeaders>,
     ) -> Option<usize> {
-        self.select_with_commit(None, workers, request_text, |_| ())
-            .map(|(idx, ())| idx)
+        let healthy = get_healthy_worker_indices(workers);
+        let model_id = normalize_model_key(workers[*healthy.first()?].model_id());
+        let (min, max) = self.load_range(workers);
+        if self.is_imbalanced(min, max) {
+            return self.select_worker_min_load(
+                workers,
+                request_text,
+                &healthy,
+                model_id,
+                max,
+                min,
+            );
+        }
+
+        // Preserve legacy selection without adding a reservation or a second
+        // load check. Only the atomic admission hook rechecks after preparation.
+        let text = request_text.unwrap_or("");
+        let tree = self.trees.get(model_id).map(|entry| entry.value().clone());
+        let affinity = tree
+            .as_ref()
+            .map(|tree| tree.prefix_match_with_counts(text));
+        let (idx, stale) = self.choose_from_affinity(workers, &healthy, affinity.as_ref())?;
+        if let Some(tree) = tree {
+            if stale {
+                if let Some(result) = affinity {
+                    tree.remove_tenant(result.tenant.as_ref());
+                }
+            } else {
+                tree.insert(text, workers[idx].url());
+            }
+        }
+        Self::record_selection(workers, idx);
+        Some(idx)
     }
 
     fn select_and_reserve<'a>(
@@ -390,7 +467,7 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         request_text: Option<&str>,
         _headers: Option<&RequestHeaders>,
     ) -> Option<(usize, WorkerLoadGuard<'a>)> {
-        self.select_with_commit(Some(context), workers, request_text, |idx| {
+        self.select_with_commit(context, workers, request_text, |idx| {
             WorkerLoadGuard::new(workers[idx].as_ref())
         })
     }
@@ -606,7 +683,7 @@ mod tests {
         let context = SelectionContext::default();
         let sentinel = WorkerLoadGuard::new(workers[0].as_ref());
         let (_, guard) = policy
-            .select_with_commit(Some(&context), &workers, Some("text"), |idx| {
+            .select_with_commit(&context, &workers, Some("text"), |idx| {
                 assert!(context.lock.try_lock().is_none());
                 WorkerLoadGuard::new(workers[idx].as_ref())
             })
