@@ -9,7 +9,7 @@ use crate::config::KvConnector;
 use crate::core::{BasicWorker, Worker, WorkerLoadGuard, WorkerType};
 use crate::metrics::RouterMetrics;
 use crate::otel_http::{self, ClientRequestOptions};
-use crate::policies::PolicyRegistry;
+use crate::policies::{LoadBalancingPolicy, PolicyRegistry, RequestHeaders, SelectionContext};
 use crate::routers::{header_utils, RouterTrait, WorkerManagement};
 use async_trait::async_trait;
 use axum::{
@@ -40,8 +40,8 @@ pub struct VllmPDRouter {
     epd: Option<super::epd::EncoderStage>,
     /// Underlying PD router for most functionality
     pd_router: PdRouterBase,
-    /// Serialize static decode selection and reservation; never held over I/O.
-    decode_selection: parking_lot::Mutex<()>,
+    /// Shared admission context for the static decode pool.
+    decode_selection: SelectionContext,
     /// Service discovery registry for dynamic ZMQ address resolution
     service_registry: Arc<ServiceRegistry>,
     /// HTTP client for making requests to discovered services
@@ -97,14 +97,12 @@ impl VllmPDRouter {
     /// Include assigned requests in local decode load while prefill is pending.
     fn select_and_reserve_decode<'a>(
         &self,
-        policy: &dyn crate::policies::LoadBalancingPolicy,
+        policy: &dyn LoadBalancingPolicy,
         workers: &'a [Arc<dyn Worker>],
         text: Option<&str>,
-        headers: Option<&crate::policies::RequestHeaders>,
+        headers: Option<&RequestHeaders>,
     ) -> Option<(usize, WorkerLoadGuard<'a>)> {
-        let _selection = self.decode_selection.lock();
-        let idx = policy.select_worker_with_headers(workers, text, headers)?;
-        Some((idx, WorkerLoadGuard::new(workers[idx].as_ref())))
+        policy.select_and_reserve(&self.decode_selection, workers, text, headers)
     }
 
     /// Query the Mooncake bootstrap server on a prefill node to get engine_id per dp_rank.
@@ -2037,7 +2035,7 @@ impl VllmPDRouter {
                     .clone()
                     .map(super::epd::EncoderStage::new),
                 pd_router,
-                decode_selection: parking_lot::Mutex::new(()),
+                decode_selection: SelectionContext::default(),
                 service_registry: Arc::new(service_registry),
                 http_client,
                 policy_registry: ctx.policy_registry.clone(),
@@ -2133,7 +2131,7 @@ impl VllmPDRouter {
                     .clone()
                     .map(super::epd::EncoderStage::new),
                 pd_router,
-                decode_selection: parking_lot::Mutex::new(()),
+                decode_selection: SelectionContext::default(),
                 service_registry: Arc::new(service_registry),
                 http_client,
                 policy_registry: ctx.policy_registry.clone(),
@@ -2878,7 +2876,7 @@ mod tests {
         VllmPDRouter {
             epd: None,
             pd_router,
-            decode_selection: parking_lot::Mutex::new(()),
+            decode_selection: SelectionContext::default(),
             service_registry: Arc::new(ServiceRegistry::new()),
             http_client: reqwest::Client::new(),
             policy_registry,
@@ -3485,7 +3483,7 @@ mod tests {
         assert_eq!(decode.load(), 0);
     }
     #[test]
-    fn review_default_cache_affinity_and_cold_mix() {
+    fn cache_aware_affinity_survives_pending_reservations() {
         use crate::policies::{CacheAwareConfig, CacheAwarePolicy, LoadBalancingPolicy};
         let router = test_vllm_pd_router();
         let workers: Vec<Arc<dyn Worker>> = (0..8)
@@ -3538,7 +3536,7 @@ mod tests {
     }
 
     #[test]
-    fn review_default_cold_burst_reservations_balance() {
+    fn cold_burst_reservations_balance_across_workers() {
         use crate::policies::{CacheAwareConfig, CacheAwarePolicy, LoadBalancingPolicy};
         let router = test_vllm_pd_router();
         let workers: Vec<Arc<dyn Worker>> = (0..8)
@@ -3570,7 +3568,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn review_dispatch_failures_release_only_owned_reservation() {
+    async fn dispatch_failures_release_only_owned_reservation() {
         for path in ["/v1/chat/completions", "/v1/completions", "/v1/responses"] {
             for mode in [
                 "prefill_http",
