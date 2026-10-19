@@ -288,9 +288,10 @@ impl CacheAwarePolicy {
         Some(min_load_idx)
     }
 
-    fn load_range(&self, workers: &[Arc<dyn Worker>]) -> (usize, usize) {
-        let (min, max) = workers.iter().fold((usize::MAX, 0usize), |(min, max), w| {
-            let load = w.load();
+    fn load_range(&self, workers: &[Arc<dyn Worker>], healthy: &[usize]) -> (usize, usize) {
+        // Use the same eligible workers for load statistics and selection.
+        let (min, max) = healthy.iter().fold((usize::MAX, 0usize), |(min, max), &idx| {
+            let load = workers[idx].load();
             (min.min(load), max.max(load))
         });
         (if min == usize::MAX { 0 } else { min }, max)
@@ -358,7 +359,7 @@ impl CacheAwarePolicy {
         let selection = context.lock.lock();
         let healthy = get_healthy_worker_indices(workers);
         let model_id = normalize_model_key(workers[*healthy.first()?].model_id());
-        let (min, max) = self.load_range(workers);
+        let (min, max) = self.load_range(workers, &healthy);
         if self.is_imbalanced(min, max) {
             let idx = Self::least_loaded(workers, &healthy)?;
             let reservation = commit(idx);
@@ -388,7 +389,7 @@ impl CacheAwarePolicy {
         let selection = context.lock.lock();
         let healthy = get_healthy_worker_indices(workers);
         healthy.first()?;
-        let (min, max) = self.load_range(workers);
+        let (min, max) = self.load_range(workers, &healthy);
         let imbalanced = self.is_imbalanced(min, max);
         let (idx, stale) = if imbalanced {
             (Self::least_loaded(workers, &healthy)?, false)
@@ -427,7 +428,7 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
     ) -> Option<usize> {
         let healthy = get_healthy_worker_indices(workers);
         let model_id = normalize_model_key(workers[*healthy.first()?].model_id());
-        let (min, max) = self.load_range(workers);
+        let (min, max) = self.load_range(workers, &healthy);
         if self.is_imbalanced(min, max) {
             return self.select_worker_min_load(
                 workers,
@@ -593,6 +594,81 @@ impl Drop for CacheAwarePolicy {
 mod tests {
     use super::*;
     use crate::core::{BasicWorker, WorkerType};
+
+    #[test]
+    fn unhealthy_worker_load_does_not_disable_cache_affinity() {
+        let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+            cache_threshold: 0.5,
+            balance_abs_threshold: 0,
+            balance_rel_threshold: 1.0,
+            eviction_interval_secs: 0,
+            max_tree_size: 100,
+        });
+        let workers: Vec<Arc<dyn Worker>> = (0..3)
+            .map(|index| {
+                Arc::new(BasicWorker::new(
+                    format!("http://worker-{index}:8000"),
+                    WorkerType::Regular,
+                )) as Arc<dyn Worker>
+            })
+            .collect();
+        workers[0].set_healthy(false);
+        workers[2].set_healthy(false);
+        policy.init_workers(&workers);
+        for _ in 0..5 {
+            workers[0].increment_load();
+            workers[1].increment_load();
+        }
+
+        // Establish affinity while worker 1 is the only healthy worker.
+        assert_eq!(policy.select_worker(&workers, Some("sticky")), Some(1));
+        workers[0].set_healthy(true);
+
+        // Both eligible workers have equal load, so the unhealthy zero-load
+        // worker must not switch the policy into load-balancing mode.
+        assert_eq!(policy.select_worker(&workers, Some("sticky")), Some(1));
+    }
+
+    #[test]
+    fn unhealthy_worker_load_does_not_disable_reserved_cache_affinity() {
+        let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+            cache_threshold: 0.5,
+            balance_abs_threshold: 0,
+            balance_rel_threshold: 1.0,
+            eviction_interval_secs: 0,
+            max_tree_size: 100,
+        });
+        let workers: Vec<Arc<dyn Worker>> = (0..3)
+            .map(|index| {
+                Arc::new(BasicWorker::new(
+                    format!("http://worker-{index}:8000"),
+                    WorkerType::Regular,
+                )) as Arc<dyn Worker>
+            })
+            .collect();
+        workers[0].set_healthy(false);
+        workers[2].set_healthy(false);
+        policy.init_workers(&workers);
+        for _ in 0..5 {
+            workers[0].increment_load();
+            workers[1].increment_load();
+        }
+
+        // Establish affinity while worker 1 is the only healthy worker.
+        assert_eq!(policy.select_worker(&workers, Some("sticky")), Some(1));
+        workers[0].set_healthy(true);
+
+        // Both eligible workers have equal load, so the unhealthy zero-load
+        // worker must not switch the policy into load-balancing mode.
+        let context = SelectionContext::default();
+        let (idx, guard) = policy
+            .select_and_reserve(&context, &workers, Some("sticky"), None)
+            .unwrap();
+        assert_eq!(idx, 1);
+        assert_eq!(workers[1].load(), 6);
+        drop(guard);
+        assert_eq!(workers[1].load(), 5);
+    }
 
     #[test]
     fn concurrent_cold_reservations_observe_each_other() {
