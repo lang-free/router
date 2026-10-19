@@ -290,10 +290,12 @@ impl CacheAwarePolicy {
 
     fn load_range(&self, workers: &[Arc<dyn Worker>], healthy: &[usize]) -> (usize, usize) {
         // Use the same eligible workers for load statistics and selection.
-        let (min, max) = healthy.iter().fold((usize::MAX, 0usize), |(min, max), &idx| {
-            let load = workers[idx].load();
-            (min.min(load), max.max(load))
-        });
+        let (min, max) = healthy
+            .iter()
+            .fold((usize::MAX, 0usize), |(min, max), &idx| {
+                let load = workers[idx].load();
+                (min.min(load), max.max(load))
+            });
         (if min == usize::MAX { 0 } else { min }, max)
     }
 
